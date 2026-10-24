@@ -9,6 +9,7 @@ import sqlite3
 import threading
 import time
 import uuid
+from decimal import Decimal
 
 import httpx
 from fastapi import FastAPI, Request
@@ -22,7 +23,7 @@ LLM_KEY = os.getenv("LLM_API_KEY") or os.getenv("GEMINI_API_KEY", "")
 LLM_MODEL = os.getenv("LLM_MODEL", "gemini-3.5-flash,gemini-3.1-flash-lite")
 LLM_EFFORT = os.getenv("LLM_EFFORT", "low")
 KEEP_BRACKETS = os.getenv("KEEP_BRACKETS", "0") == "1"
-CACHE_VER = "v1"
+CACHE_VER = "v2"
 
 MEDIA = "application/a2a+json"
 BATCH_MT = "application/vnd.ga5.invoice-claim-batch+json"
@@ -159,6 +160,7 @@ Actions:
 How to read the documents:
 - They mix useful facts with old examples, archive cases, training decoys, negated sentences ("no hold is needed", "this is not a duplicate") and irrelevant action words. Decide only from the CURRENT authoritative case paragraph. Ignore archive examples, training material and templates. Respect negation and the current policy.
 - The decisive paragraph is the one that states the facts that determine the action. It carries exactly three bracketed references. Return exactly those three references, copied verbatim from the text, in order of appearance. Never return the cover-sheet reference, archive-example references or training-decoy references.
+- Choose settle_invoice ONLY if the decisive paragraph positively says the totals reconcile, goods were received, there is no earlier payment, and the amount is within authority. If it mentions an amount above a limit or ceiling, a changed bank account or pending callback, an earlier payment, or a conflict between records, choose the matching non-settle action instead.
 - facts: vendorName (string), invoiceNumber (string), amountMinor (INTEGER in minor currency units, for example 1,234.50 INR is 123450; use the amount of the current invoice), currency (ISO code such as INR).
 - rationale: 1 to 3 sentences, at most 400 characters, naming the action and why.
 
@@ -307,6 +309,53 @@ def decide_batch(packages, deadline):
     return out
 
 
+# ---------------- pattern guard (safety net over the model) ----------------
+def _paras(p):
+    for doc in (p.get("documents") or []) if isinstance(p, dict) else []:
+        if isinstance(doc, dict):
+            for para in str(doc.get("text", "")).split("\n\n"):
+                yield para
+
+
+def guard(p, n):
+    n = dict(n)
+    try:
+        decisive = []
+        for para in _paras(p):
+            refs = re.findall(r"\[([^\[\]]+)\]", para)
+            if len(refs) == 3 and "archive note" not in para.lower():
+                decisive.append((para, refs))
+        if len(decisive) == 1:
+            para, refs = decisive[0]
+            t = para.lower()
+            n["refs"] = refs
+            act = None
+            if any(k in t for k in ("named financial approver", "named approver", "exceeds", "below the stated total")):
+                act = "request_approval"
+            elif any(k in t for k in ("exception case", "exception workflow", "exception queue",
+                                      "outside the permitted", "contradictory", "incompatible")):
+                act = "open_exception"
+            elif any(k in t for k in ("second disbursement", "earlier settled entry",
+                                      "exact commercial duplicate", "earlier posting for the same")):
+                act = "reject_duplicate"
+            elif any(k in t for k in ("callback", "out-of-band", "beneficiary",
+                                      "destination-account", "bank account")):
+                act = "hold_invoice"
+            if act and act != n.get("action"):
+                n["action"] = act
+                n["why"] = "The decisive paragraph supports this action."
+        text = " ".join(_paras(p))
+        m = re.search(r"stated total ([A-Z]{3}) ([\d,]+(?:\.\d+)?)", text)
+        v = re.search(r"Supplier (.+?); invoice ([^;]+);", text)
+        if m and v:
+            n["facts"] = {"vendorName": v.group(1).strip(), "invoiceNumber": v.group(2).strip(),
+                          "amountMinor": int((Decimal(m.group(2).replace(",", "")) * 100).to_integral_value()),
+                          "currency": m.group(1)}
+    except Exception:
+        pass
+    return n
+
+
 def make_rationale(action, why, refs):
     base = " ".join(why.split())[:900]
     tag = ", ".join(f"[{r}]" for r in refs)
@@ -387,10 +436,12 @@ def handle_initial(principal, msg, mh, hist):
         decisions = decide_batch(pkgs, time.time() + 40)
     except Exception as ex:
         log_event("model_failure", str(ex)[:500])
+        print("MODEL_FAILURE", str(ex)[:300], flush=True)
         return err(503, "MODEL_UNAVAILABLE", "Temporary failure, please retry.")
     proposals = []
     for p in pkgs:
-        d = decisions[p["packageId"]]
+        d = guard(p, decisions[p["packageId"]])
+        print("DECISION", p["packageId"][-6:], d["action"], d["refs"], flush=True)
         proposals.append({
             "packageId": p["packageId"], "actionId": "act-" + uuid.uuid4().hex[:20], "action": d["action"],
             "facts": d["facts"], "evidenceRefs": [f"[{r}]" if KEEP_BRACKETS else r for r in d["refs"]],
@@ -497,7 +548,7 @@ def card(request: Request):
     return JSONResponse(agent_card(request), headers={"Cache-Control": "no-store"})
 
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 def health():
     return {"status": "ok"}
 
